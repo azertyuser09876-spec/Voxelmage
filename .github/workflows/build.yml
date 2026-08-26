@@ -1,0 +1,297 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  GODOT_VERSION: 4.4.1
+  GODOT_TAG: 4.4.1-stable
+
+jobs:
+  build:
+    name: Compilation (.exe / .apk / web)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Recuperer le depot
+        uses: actions/checkout@v4
+
+      # =====================================================  OUTILLAGE  =====
+      - name: Installer Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Installer le SDK Android
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "cmdline-tools;latest platform-tools build-tools;34.0.0 platforms;android-34"
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Dependances Python
+        run: pip install --quiet pillow numpy
+
+      - name: Mettre en cache Godot et ses templates
+        id: cache-godot
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/godot-bin
+            ~/.local/share/godot/export_templates
+          key: godot-${{ env.GODOT_TAG }}
+
+      - name: Telecharger Godot ${{ env.GODOT_VERSION }}
+        if: steps.cache-godot.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/godot-bin
+          BASE="https://github.com/godotengine/godot/releases/download/${GODOT_TAG}"
+          curl -fsSL -o godot.zip "${BASE}/Godot_v${GODOT_TAG}_linux.x86_64.zip"
+          unzip -q godot.zip
+          mv "Godot_v${GODOT_TAG}_linux.x86_64" ~/godot-bin/godot
+          chmod +x ~/godot-bin/godot
+          curl -fsSL -o templates.tpz "${BASE}/Godot_v${GODOT_TAG}_export_templates.tpz"
+          unzip -q templates.tpz
+          mkdir -p ~/.local/share/godot/export_templates/${GODOT_VERSION}.stable
+          mv templates/* ~/.local/share/godot/export_templates/${GODOT_VERSION}.stable/
+
+      - name: Ajouter Godot au PATH
+        run: echo "$HOME/godot-bin" >> $GITHUB_PATH
+
+      # ======================================================  PROJET  =======
+      - name: Regenerer les assets proceduraux
+        run: python3 tools/generate_assets.py
+
+      - name: Importer les ressources
+        run: |
+          godot --headless --import 2>&1 | tee import.log || true
+          if grep -qE "SCRIPT ERROR|Parse Error" import.log; then
+            echo "::error::Erreur de script detectee pendant l'import"
+            exit 1
+          fi
+
+      - name: Test de fumee (monde, craft, magie, entites)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb libgl1 libglx-mesa0 libegl1 libgl1-mesa-dri
+          xvfb-run -a -s "-screen 0 1280x720x24" \
+            godot --rendering-driver opengl3 --resolution 1280x720 --smoke 2>&1 | tee smoke.log
+          grep -q "\[smoke\] OK" smoke.log || { echo "::error::Test de fumee en echec"; exit 1; }
+
+      - name: Test des commandes (souris, clavier, molette, interface)
+        run: |
+          xvfb-run -a -s "-screen 0 1280x720x24" \
+            godot --rendering-driver opengl3 --resolution 1280x720 --inputtest 2>&1 | tee input.log
+          grep -q "\[input\] OK" input.log || { echo "::error::Test des commandes en echec"; exit 1; }
+
+      - name: Recuperer les captures du test
+        if: always()
+        run: |
+          mkdir -p captures
+          cp ~/.local/share/godot/app_userdata/VoxelMage/smoke_*.png captures/ 2>/dev/null || true
+
+      - name: Publier les captures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: captures-test
+          path: captures/
+          if-no-files-found: ignore
+
+      # ================================  SIGNATURE ET REGLAGES ANDROID  ======
+      - name: Preparer la clef de signature
+        run: |
+          set -euo pipefail
+          if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+            echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$PWD/release.keystore"
+            echo "KEY_USER=${{ secrets.ANDROID_KEY_ALIAS }}" >> $GITHUB_ENV
+            echo "KEY_PASS=${{ secrets.ANDROID_KEY_PASSWORD }}" >> $GITHUB_ENV
+          else
+            keytool -genkeypair -keyalg RSA -validity 10000 \
+              -alias voxelmage -keystore "$PWD/release.keystore" \
+              -storepass voxelmage -keypass voxelmage \
+              -dname "CN=VoxelMage, O=VoxelMage, C=FR" -noprompt
+            echo "KEY_USER=voxelmage" >> $GITHUB_ENV
+            echo "KEY_PASS=voxelmage" >> $GITHUB_ENV
+          fi
+          echo "KEYSTORE=$PWD/release.keystore" >> $GITHUB_ENV
+
+      - name: Ecrire les reglages editeur (chemin du SDK + clef debug)
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/godot
+          # ATTENTION : ecrit ligne par ligne, SANS heredoc.
+          # Un heredoc dans un bloc YAML conserve l'indentation et casse le .tres.
+          SETTINGS=~/.config/godot/editor_settings-4.4.tres
+          {
+            echo '[gd_resource type="EditorSettings" format=3]'
+            echo ''
+            echo '[resource]'
+            echo "export/android/android_sdk_path = \"$ANDROID_HOME\""
+            echo "export/android/java_sdk_path = \"$JAVA_HOME\""
+            echo "export/android/debug_keystore = \"$KEYSTORE\""
+            echo "export/android/debug_keystore_user = \"$KEY_USER\""
+            echo "export/android/debug_keystore_pass = \"$KEY_PASS\""
+          } > "$SETTINGS"
+          echo "----- $SETTINGS -----"
+          cat "$SETTINGS"
+
+      - name: Injecter la clef de release dans le preset
+        run: |
+          python3 - <<'PY'
+          import os, re
+          path = "export_presets.cfg"
+          cfg = open(path, encoding="utf-8").read()
+          keys = {
+              "keystore/release": os.environ["KEYSTORE"],
+              "keystore/release_user": os.environ["KEY_USER"],
+              "keystore/release_password": os.environ["KEY_PASS"],
+              "keystore/debug": os.environ["KEYSTORE"],
+              "keystore/debug_user": os.environ["KEY_USER"],
+              "keystore/debug_password": os.environ["KEY_PASS"],
+          }
+          # Repere la section d'options du preset Android
+          m = re.search(r'\[preset\.(\d+)\]\s*\n\s*name="Android"', cfg)
+          if not m:
+              raise SystemExit("preset Android introuvable dans export_presets.cfg")
+          idx = m.group(1)
+          header = f"[preset.{idx}.options]"
+          start = cfg.index(header) + len(header)
+          nxt = cfg.find("\n[preset.", start)
+          end = len(cfg) if nxt == -1 else nxt
+          block = cfg[start:end]
+          for k, v in keys.items():
+              line = f'{k}="{v}"'
+              if re.search(rf'^{re.escape(k)}=.*$', block, re.M):
+                  block = re.sub(rf'^{re.escape(k)}=.*$', line, block, flags=re.M)
+              else:
+                  block = block.rstrip("\n") + "\n" + line + "\n"
+          open(path, "w", encoding="utf-8").write(cfg[:start] + block + cfg[end:])
+          print("Clefs injectees dans", header)
+          PY
+
+      - name: Diagnostic Android
+        run: |
+          echo "ANDROID_HOME = $ANDROID_HOME"
+          echo "JAVA_HOME    = $JAVA_HOME"
+          ls "$ANDROID_HOME/platform-tools/adb"        || echo "!! adb absent"
+          ls "$ANDROID_HOME/build-tools/"              || echo "!! build-tools absent"
+          find "$ANDROID_HOME/build-tools" -name "apksigner" | head -1 || true
+          ls ~/.local/share/godot/export_templates/${GODOT_VERSION}.stable/android_release.apk \
+            || echo "!! template android_release.apk absent"
+
+      # =====================================================  EXPORTS  ======
+      - name: Preparer les dossiers de sortie
+        run: mkdir -p build/windows build/android build/web
+
+      - name: Export Windows (.exe)
+        run: |
+          set -euo pipefail
+          godot --headless --export-release "Windows Desktop" build/windows/VoxelMage.exe
+          test -f build/windows/VoxelMage.exe
+          ls -la build/windows
+
+      - name: Export Web
+        run: |
+          set -euo pipefail
+          godot --headless --export-release "Web" build/web/index.html
+          test -f build/web/index.html
+          ls -la build/web
+
+      - name: Export Android (.apk)
+        id: android
+        continue-on-error: true
+        env:
+          GODOT_ANDROID_KEYSTORE_RELEASE_PATH: ${{ env.KEYSTORE }}
+          GODOT_ANDROID_KEYSTORE_RELEASE_USER: ${{ env.KEY_USER }}
+          GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD: ${{ env.KEY_PASS }}
+          GODOT_ANDROID_KEYSTORE_DEBUG_PATH: ${{ env.KEYSTORE }}
+          GODOT_ANDROID_KEYSTORE_DEBUG_USER: ${{ env.KEY_USER }}
+          GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD: ${{ env.KEY_PASS }}
+        run: |
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
+          adb start-server >/dev/null 2>&1 || true   # evite "cannot connect to daemon"
+          echo "--- tentative release ---"
+          godot --headless --export-release "Android" "$PWD/build/android/VoxelMage.apk" 2>&1 \
+            | tee android.log || true
+          if [ ! -f build/android/VoxelMage.apk ]; then
+            echo "--- tentative debug ---"
+            godot --headless --export-debug "Android" "$PWD/build/android/VoxelMage.apk" 2>&1 \
+              | tee -a android.log || true
+          fi
+          if [ -f build/android/VoxelMage.apk ]; then
+            ls -la build/android
+            echo "apk=true" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::APK non produit - voir android.log ci-dessous"
+            grep -iE "error|keystore|sdk|apksigner|java" android.log | head -40 || true
+            echo "apk=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Journal Android
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-android
+          path: android.log
+          if-no-files-found: ignore
+
+      # ===================================================  ARTEFACTS  ======
+      - name: Archiver Windows
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoxelMage-windows
+          path: build/windows/
+
+      - name: Archiver Web
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoxelMage-web
+          path: build/web/
+
+      - name: Archiver Android
+        if: steps.android.outputs.apk == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoxelMage-android
+          path: build/android/
+
+      # ==============================================  PAGES + RELEASE  =====
+      - name: Preparer GitHub Pages
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        run: |
+          mkdir -p public
+          cp -r build/web/* public/
+          cp docs/servers.json public/servers.json
+
+      - name: Publier sur GitHub Pages
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
+          force_orphan: true
+
+      - name: Creer la Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: VoxelMage ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          files: |
+            build/windows/VoxelMage.exe
+            build/android/VoxelMage.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
