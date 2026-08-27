@@ -1,0 +1,14 @@
+{
+  "_comment": "Liste publique statique, servie par GitHub Pages. Pour ajouter un serveur permanent, ouvrez une pull request qui complete le tableau 'servers'. Les parties temporaires n'ont pas besoin d'etre ici : elles apparaissent toutes seules sur le reseau local, ou se rejoignent par code direct.",
+  "servers": [
+    {
+      "name": "Exemple - serveur communautaire",
+      "ip": "203.0.113.10",
+      "port": 24565,
+      "code": "EXMPL1",
+      "players": 0,
+      "max": 16,
+      "enabled": false
+    }
+  ]
+}
